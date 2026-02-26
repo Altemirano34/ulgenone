@@ -1,0 +1,280 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ──────────────────────────────────────────────
+    // Helper functions
+    // ──────────────────────────────────────────────
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isSuperAdmin() {
+      return isAuthenticated() && getUserData().role == 'super_admin';
+    }
+
+    function isCorporateUser() {
+      return isAuthenticated() &&
+        getUserData().role in ['company_admin', 'company_member'];
+    }
+
+    function isCompanyAdmin() {
+      return isAuthenticated() && getUserData().role == 'company_admin';
+    }
+
+    function belongsToCompany(companyCode) {
+      return isAuthenticated() && getUserData().companyCode == companyCode;
+    }
+
+    function isOwner(uid) {
+      return isAuthenticated() && request.auth.uid == uid;
+    }
+
+    // ──────────────────────────────────────────────
+    // USERS collection
+    // ──────────────────────────────────────────────
+    match /users/{userId} {
+      allow read: if isAuthenticated() && (
+        isSuperAdmin() ||
+        request.auth.uid == userId ||
+        (isCorporateUser() && belongsToCompany(resource.data.companyCode))
+      );
+
+      allow create: if isAuthenticated() &&
+        (isSuperAdmin() || (request.auth.uid == userId && request.resource.data.role != 'super_admin'));
+
+      allow update: if isAuthenticated() && (
+        // Super admin has full update power
+        isSuperAdmin() ||
+        // Users can ONLY update their own basic profile info (not role, not isActive, not companyCode)
+        (request.auth.uid == userId && 
+         request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['name', 'profileInfo', 'profileCompleted', 'updatedAt', 'logoBase64', 'settings']))
+      );
+
+      allow delete: if isSuperAdmin();
+
+      // User's sheets subcollection (safiha inventory)
+      match /sheets/{sheetId} {
+        allow read, write: if isAuthenticated() && request.auth.uid == userId;
+        allow delete: if isAuthenticated() && request.auth.uid == userId;
+      }
+    }
+
+    // ──────────────────────────────────────────────
+    // COMPANIES collection
+    // ──────────────────────────────────────────────
+    match /companies/{companyCode} {
+      allow get: if isAuthenticated();
+      
+      allow list: if isAuthenticated() && (isSuperAdmin() || belongsToCompany(companyCode));
+
+      allow create: if isAuthenticated() && (isSuperAdmin() || (request.resource.data.adminUid == request.auth.uid));
+
+      allow update: if isAuthenticated() && isSuperAdmin();
+
+      allow delete: if isSuperAdmin();
+    }
+
+    // ──────────────────────────────────────────────
+    // SUBSCRIPTIONS collection
+    // ──────────────────────────────────────────────
+    match /subscriptions/{companyCode} {
+      allow read: if isAuthenticated() && (isSuperAdmin() || belongsToCompany(companyCode));
+      allow write: if isSuperAdmin();
+    }
+
+    // ──────────────────────────────────────────────
+    // OFFERS collection
+    // ──────────────────────────────────────────────
+    match /offers/{offerId} {
+      // FIX Gap 1: Tightened read — company-scoped, not globally readable
+      allow read: if isAuthenticated() && (
+        isSuperAdmin() ||
+        resource.data.createdByUid == request.auth.uid ||
+        (isCorporateUser() &&
+         resource.data.companyCode != null &&
+         belongsToCompany(resource.data.companyCode))
+      );
+
+      // Create: authenticated user, status must start as 'draft', isDeleted must be false
+      allow create: if isAuthenticated() &&
+        request.resource.data.createdByUid == request.auth.uid &&
+        request.resource.data.status == 'draft' &&
+        request.resource.data.isDeleted == false &&
+        (isSuperAdmin() || (
+            request.resource.data.companyCode == getUserData().companyCode &&
+            getUserData().profileCompleted == true
+        ));
+
+      allow update: if isAuthenticated() && (
+        isSuperAdmin() ||
+        ( 
+          // 1. PROTECT IMMUTABLE CORE FIELDS (Everyone except SuperAdmin)
+          request.resource.data.createdByUid == resource.data.createdByUid &&
+          request.resource.data.companyCode == resource.data.companyCode &&
+          request.resource.data.createdAt == resource.data.createdAt &&
+          
+          (
+            // CASE 1: Soft delete (Allowed for owner or company admin)
+            // Strict: Only metadata fields can change if status is Approved/Rejected
+            (request.resource.data.isDeleted == true && resource.data.isDeleted == false && (
+              resource.data.createdByUid == request.auth.uid ||
+              (isCompanyAdmin() && belongsToCompany(resource.data.companyCode))
+            ) && request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['isDeleted', 'deletedAt', 'deletedByUid', 'deletedByRole', 'status', 'updatedAt'])) ||
+            
+            // CASE 2: Workflow Transitions & Edits
+            (
+              // TRULY ENFORCE IMMUTABILITY: Block sensitive field changes if status is Approved/Rejected
+              resource.data.status in ['approved', 'rejected'] == false &&
+              
+              (
+                // A. Owner editing DRAFT (Full edit, core immutability handled above)
+                (resource.data.status == 'draft' && request.resource.data.status == 'draft' &&
+                 resource.data.createdByUid == request.auth.uid) ||
+                
+                // B. Owner submitting DRAFT -> PENDING
+                (resource.data.status == 'draft' && request.resource.data.status == 'pending_approval' && 
+                 resource.data.createdByUid == request.auth.uid &&
+                 request.resource.data.diff(resource.data).affectedKeys()
+                    .hasOnly(['status', 'submittedAt', 'submittedByUid', 'updatedAt'])) ||
+                
+                // C. Owner withdrawing PENDING -> DRAFT
+                (resource.data.status == 'pending_approval' && request.resource.data.status == 'draft' &&
+                 resource.data.createdByUid == request.auth.uid &&
+                 request.resource.data.diff(resource.data).affectedKeys()
+                    .hasOnly(['status', 'updatedAt'])) ||
+                
+                // D. Admin approving PENDING -> APPROVED
+                (resource.data.status == 'pending_approval' && request.resource.data.status == 'approved' &&
+                 isCompanyAdmin() && belongsToCompany(resource.data.companyCode) &&
+                 request.resource.data.diff(resource.data).affectedKeys()
+                    .hasOnly(['status', 'approvedAt', 'approvedByUid', 'updatedAt'])) ||
+                
+                // E. Admin rejecting PENDING -> REJECTED
+                (resource.data.status == 'pending_approval' && request.resource.data.status == 'rejected' &&
+                 isCompanyAdmin() && belongsToCompany(resource.data.companyCode) &&
+                 request.resource.data.diff(resource.data).affectedKeys()
+                    .hasOnly(['status', 'rejectedAt', 'rejectedByUid', 'rejectionReason', 'updatedAt']))
+              )
+            )
+          )
+        )
+      );
+
+      // Hard Delete: only for owner of draft
+      allow delete: if isAuthenticated() && (
+        isSuperAdmin() ||
+        (resource.data.createdByUid == request.auth.uid && resource.data.status == 'draft')
+      );
+    }
+
+    // ──────────────────────────────────────────────
+    // BULK OFFERS collection
+    // ──────────────────────────────────────────────
+    match /bulkOffers/{offerId} {
+      allow read: if isAuthenticated() && (
+        isSuperAdmin() ||
+        resource.data.createdByUid == request.auth.uid ||
+        (isCorporateUser() &&
+         resource.data.companyCode != null &&
+         belongsToCompany(resource.data.companyCode))
+      );
+
+      allow create: if isAuthenticated() &&
+        request.resource.data.createdByUid == request.auth.uid &&
+        request.resource.data.isDeleted == false;
+
+      allow update: if isAuthenticated() && (
+        isSuperAdmin() ||
+        resource.data.createdByUid == request.auth.uid
+      );
+
+      allow delete: if isAuthenticated() && (
+        isSuperAdmin() ||
+        (resource.data.createdByUid == request.auth.uid && resource.data.status == 'draft')
+      );
+    }
+
+    // ──────────────────────────────────────────────
+    // PRICE LISTS collection (future-proofed)
+    // ──────────────────────────────────────────────
+    match /priceLists/{priceListId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    // ──────────────────────────────────────────────
+    // SETTINGS collection (future-proofed)
+    // ──────────────────────────────────────────────
+    match /settings/{settingId} {
+      allow read: if isSuperAdmin();
+      allow write: if isSuperAdmin();
+    }
+
+    // ──────────────────────────────────────────────
+    // AUDIT LOGS collection (future-proofed)
+    // ──────────────────────────────────────────────
+    match /auditLogs/{logId} {
+      allow create: if isAuthenticated();
+      allow read: if isSuperAdmin();
+      allow update, delete: if false; // immutable
+    }
+    // ──────────────────────────────────────────────
+    // USAGE collection (for tracking plan quotas)
+    // ──────────────────────────────────────────────
+    match /usage/{companyId} {
+      allow read: if isAuthenticated() && (isSuperAdmin() || belongsToCompany(companyId) || request.auth.uid == companyId);
+      allow write: if isAuthenticated() && (isSuperAdmin() || belongsToCompany(companyId) || request.auth.uid == companyId);
+      
+      match /monthly/{monthKey} {
+        allow read, write: if isAuthenticated() && (isSuperAdmin() || belongsToCompany(companyId) || request.auth.uid == companyId);
+      }
+    }
+
+    // ──────────────────────────────────────────────
+    // OFFER CALCULATIONS LOGGING
+    // ──────────────────────────────────────────────
+    match /offer_calculations/{docId} {
+      // READ: Only Super Admin
+      allow read: if isSuperAdmin();
+
+      // CREATE: Any authenticated user (logging their own calc)
+      allow create: if isAuthenticated();
+
+      // UPDATE: 
+      // 1. Allow creator to link offer ID (Part 3)
+      // 2. Allow Super Admin to soft-delete (isDeleted, deletedAt, deletedByUid)
+      allow update: if 
+         (isAuthenticated() && 
+          resource.data.userUid == request.auth.uid &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['convertedToOfferId']))
+         ||
+         (isSuperAdmin() && 
+          request.resource.data.diff(resource.data).changedKeys().hasOnly(['isDeleted', 'deletedAt', 'deletedByUid']));
+
+      // DELETE: Allow Super Admin to hard-delete
+      allow delete: if isSuperAdmin();
+    }
+
+    // ──────────────────────────────────────────────
+    // PHONE REGISTRY (for secure duplication checks)
+    // ──────────────────────────────────────────────
+    match /phone_registry/{phoneDigits} {
+      // allow get: anyone can check if a phone number exists
+      allow get: if true;
+      // allow create/update: only authenticated users can claim their phone
+      allow create, update: if isAuthenticated();
+      // allow list: strictly forbidden to avoid scraping
+      allow list: if false;
+    }
+
+  }
+}
